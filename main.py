@@ -6,7 +6,7 @@ import uasyncio as asyncio
 
 CONFIG_FILE = "wifi_config.json"
 
-PWM_PIN = 12  # Hardware PWM GPIO pin
+PWM_PIN = 19  # Hardware PWM GPIO pin
 PWM_FREQ = 25000  # 25kHz prevents camera shutter banding/flicker
 
 # --- GLOBAL DEVICE STATE ---
