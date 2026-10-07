@@ -14,6 +14,7 @@ device_state = {
     "brightness": 0,  # 0 to 1023 (10-bit PWM)
     "calibratorstate": 4,  # 0=NotReady, 1=Ready, 2=Calibrating, 3=Failed, 4=Off
     "coverstate": 0,  # 0=NotPresent
+    "connected": False,
 }
 
 # --- HARDWARE SETUP ---
@@ -25,26 +26,9 @@ def save_wifi_credentials(ssid, password):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump({"ssid": ssid, "pass": password}, f)
-        print("Wi-Fi configuration saved successfully.")
+        print("[DEBUG] Wi-Fi configuration saved successfully.")
     except Exception as e:
-        print(f"Error saving Wi-Fi configuration: {e}")
-
-
-def parse_http_body(body):
-    """Utility to parse application/x-www-form-urlencoded payloads."""
-    params = {}
-    if not body:
-        return params
-
-    body = body.replace("+", " ")
-    pairs = body.split("&")
-    for pair in pairs:
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-            k = unquote(k.strip().lower())
-            v = unquote(v.strip())
-            params[k] = v
-    return params
+        print(f"[DEBUG] Error saving Wi-Fi configuration: {e}")
 
 
 def unquote(string):
@@ -60,6 +44,23 @@ def unquote(string):
         else:
             res += "%" + part
     return res
+
+
+def parse_query_or_body(data_str):
+    """Utility to parse key-value pairs from URL query strings or form payloads."""
+    params = {}
+    if not data_str:
+        return params
+
+    data_str = data_str.replace("+", " ")
+    pairs = data_str.split("&")
+    for pair in pairs:
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            k = unquote(k.strip().lower())
+            v = unquote(v.strip())
+            params[k] = v
+    return params
 
 
 def build_alpaca_response(
@@ -87,6 +88,15 @@ def update_pwm_brightness(new_brightness):
         device_state["calibratorstate"] = 1  # Ready / Emitting
     else:
         device_state["calibratorstate"] = 4  # Off
+
+
+async def safe_close_writer(writer):
+    """Safely closes standard MicroPython uasyncio StreamWriters."""
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
 
 
 # --- WEB MANAGEMENT DASHBOARD (PORT 80) ---
@@ -169,7 +179,7 @@ async def handle_http_client(reader, writer):
             body = await reader.read(content_length)
             body_data = body.decode("utf-8")
 
-        params = parse_http_body(body_data)
+        params = parse_query_or_body(body_data)
 
         if url == "/save_wifi" and method == "POST":
             new_ssid = params.get("ssid", "")
@@ -185,9 +195,8 @@ async def handle_http_client(reader, writer):
                 )
                 writer.write(response_html.encode("utf-8"))
                 await writer.drain()
-                await writer.close()
+                await safe_close_writer(writer)
 
-                # Reboot after providing time to flush network response
                 await asyncio.sleep(2)
                 machine.reset()
                 return
@@ -196,7 +205,6 @@ async def handle_http_client(reader, writer):
             if "pwm" in params:
                 update_pwm_brightness(params["pwm"])
 
-        # Render main dashboard
         response_html = render_web_page()
         writer.write(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
@@ -205,9 +213,9 @@ async def handle_http_client(reader, writer):
         await writer.drain()
 
     except Exception as e:
-        print(f"HTTP Server Exception: {e}")
+        print(f"[DEBUG] HTTP Server Exception: {e}")
     finally:
-        await writer.close()
+        await safe_close_writer(writer)
 
 
 # --- ASCOM ALPACA SERVER (PORT 11111) ---
@@ -224,6 +232,13 @@ async def handle_alpaca_client(reader, writer):
             return
         method, url = parts[0], parts[1]
 
+        print(f"[ALPACA DEBUG] Incoming Request: {method} {url}")
+
+        url_path = url
+        query_string = ""
+        if "?" in url:
+            url_path, query_string = url.split("?", 1)
+
         content_length = 0
         while True:
             line = await reader.readline()
@@ -234,55 +249,109 @@ async def handle_alpaca_client(reader, writer):
                 content_length = int(line_str.split(":")[1].strip())
 
         body_data = ""
-        if method == "POST" and content_length > 0:
+        if content_length > 0:
             body = await reader.read(content_length)
             body_data = body.decode("utf-8")
 
-        params = parse_http_body(body_data)
+        # Combine parameters from both query string and body
+        params = parse_query_or_body(query_string)
+        params.update(parse_query_or_body(body_data))
+
         client_id = params.get("clienttransactionid", 0)
         trans_id = params.get("servertransactionid", 42)
 
-        url_lower = url.lower()
-        writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-        )
+        print(f"[ALPACA DEBUG] Parameters Parsed: {params}")
 
-        if "covercalibrator/0/brightness" in url_lower:
+        url_lower = url_path.lower()
+
+        # Handle Connected property
+        if "covercalibrator/0/connected" in url_lower:
             if method == "GET":
+                value = device_state["connected"]
+                print(f"[ALPACA DEBUG] ASCOM Checking Connected status -> {value}")
+                data = build_alpaca_response(client_id, trans_id, value=value)
+            elif method == "PUT":
+                conn_val = params.get("connected", "false").lower() == "true"
+                device_state["connected"] = conn_val
+                print(f"[ALPACA DEBUG] ASCOM Set Connected -> {conn_val}")
+                data = build_alpaca_response(client_id, trans_id)
+
+        # Handle Standard ASCOM CoverCalibrator Methods & Attributes
+        elif "covercalibrator/0/brightness" in url_lower:
+            if method == "GET":
+                print(
+                    f"[ALPACA DEBUG] Getting Brightness: {device_state['brightness']}"
+                )
                 data = build_alpaca_response(
                     client_id, trans_id, value=device_state["brightness"]
                 )
             else:
                 new_brightness = params.get("brightness", 0)
+                print(f"[ALPACA DEBUG] Setting Brightness: {new_brightness}")
                 update_pwm_brightness(new_brightness)
                 data = build_alpaca_response(client_id, trans_id)
 
         elif "covercalibrator/0/calibratorstate" in url_lower:
+            print(
+                f"[ALPACA DEBUG] Getting CalibratorState: {device_state['calibratorstate']}"
+            )
             data = build_alpaca_response(
                 client_id, trans_id, value=device_state["calibratorstate"]
             )
 
         elif "covercalibrator/0/coverstate" in url_lower:
+            print(
+                f"[ALPACA DEBUG] Getting CoverState: {device_state['coverstate']}"
+            )
             data = build_alpaca_response(
                 client_id, trans_id, value=device_state["coverstate"]
             )
 
         elif "covercalibrator/0/calibratoroff" in url_lower and method == "PUT":
+            print("[ALPACA DEBUG] CalibratorOff command received.")
             update_pwm_brightness(0)
             data = build_alpaca_response(client_id, trans_id)
 
         elif "covercalibrator/0/calibratoron" in url_lower and method == "PUT":
             brightness_target = int(params.get("brightness", 512))
+            print(
+                f"[ALPACA DEBUG] CalibratorOn command received. Brightness: {brightness_target}"
+            )
             update_pwm_brightness(brightness_target)
             data = build_alpaca_response(client_id, trans_id)
 
-        elif "covercalibrator/0/connected" in url_lower:
-            if method == "GET":
-                data = build_alpaca_response(client_id, trans_id, value=True)
-            else:
-                data = build_alpaca_response(client_id, trans_id)
+        elif "covercalibrator/0/maxbrightness" in url_lower:
+            print("[ALPACA DEBUG] Querying MaxBrightness (1023)")
+            data = build_alpaca_response(client_id, trans_id, value=1023)
+
+        elif "covercalibrator/0/interfaceversion" in url_lower:
+            print("[ALPACA DEBUG] Querying InterfaceVersion (1)")
+            data = build_alpaca_response(client_id, trans_id, value=1)
+
+        elif "covercalibrator/0/driverinfo" in url_lower:
+            print("[ALPACA DEBUG] Querying DriverInfo")
+            data = build_alpaca_response(
+                client_id, trans_id, value="MicroPython ESP32 Lacerta CoverCalibrator"
+            )
+
+        elif "covercalibrator/0/driverversion" in url_lower:
+            print("[ALPACA DEBUG] Querying DriverVersion")
+            data = build_alpaca_response(client_id, trans_id, value="1.0")
+
+        elif "covercalibrator/0/name" in url_lower:
+            print("[ALPACA DEBUG] Querying Name")
+            data = build_alpaca_response(
+                client_id, trans_id, value="Lacerta Lightbox"
+            )
+
+        elif "covercalibrator/0/description" in url_lower:
+            print("[ALPACA DEBUG] Querying Description")
+            data = build_alpaca_response(
+                client_id, trans_id, value="ESP32 Wireless Flat Panel"
+            )
 
         elif "management/v1/configureddevices" in url_lower:
+            print("[ALPACA DEBUG] ASCOM Configured Devices Discovery query")
             devices = [
                 {
                     "DeviceName": "Lacerta Wireless Flat Panel",
@@ -294,15 +363,26 @@ async def handle_alpaca_client(reader, writer):
             data = build_alpaca_response(client_id, trans_id, value=devices)
 
         else:
+            print(f"[ALPACA DEBUG] Generic response for path: {url_path}")
             data = build_alpaca_response(client_id, trans_id)
 
-        writer.write(json.dumps(data).encode("utf-8"))
+        payload = json.dumps(data).encode("utf-8")
+        headers = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("utf-8")
+
+        writer.write(headers)
+        writer.write(payload)
         await writer.drain()
+        print("[ALPACA DEBUG] Response sent successfully.")
 
     except Exception as e:
-        print(f"Alpaca Exception: {e}")
+        print(f"[ALPACA DEBUG] Alpaca Exception: {e}")
     finally:
-        await writer.close()
+        await safe_close_writer(writer)
 
 
 # --- ASYNC MAIN EVENT LOOP ---
