@@ -16,4 +16,21 @@ Combining AI code generation, ESP32 with micropython and the Alpaca ASCOM protoc
 - The controller can be controlled via the Alpaca protocol on NiNa or Kstars or any other software supporting Alpaca
 - The controller has also a webportal where you can manually change the light or enter an alternative Wifi network
 
+**Build of Materials (BOM)**
+- ESP32 WROOM microcontroller
+- IRLZ44N Mosfet transistor
+- Resistor 150 ohm
+- Resistor 10K ohm 
+- 2x 12V connectors cable
+- 12V to USB (5V) ccar adaptor
+- Lightbox Lacerta dimmable on 12V
 
+![photo of devices](https://github.com/HenkUyttenhove/lightbox_calpaca-drivers/blob/main/BOM.jpg)
+
+  **Wire diagram**
+  
+  ![Wire Diagram](https://github.com/HenkUyttenhove/lightbox_calpaca-drivers/blob/main/schema.jpg)
+
+  **The PY files are uploaded to the repository**
+
+  ![webinterface](https://github.com/HenkUyttenhove/lightbox_calpaca-drivers/blob/main/webinterface.jpg)
